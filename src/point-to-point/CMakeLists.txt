@@ -42,6 +42,7 @@ build_lib(
     helper/point-to-point-helper.h
     helper/qbb-helper.h
     helper/sim-setting.h
+    model/cc-trace.h
     model/cn-header.h
     model/pause-header.h
     model/pint.h

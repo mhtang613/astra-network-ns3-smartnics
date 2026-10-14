@@ -11,6 +11,7 @@
 #include "ppp-header.h"
 #include "ns3/simulator.h"
 #include "ns3/int-header.h"
+#include "cc-trace.h"
 #include <cmath>
 
 namespace ns3 {
@@ -211,6 +212,10 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 				p->RemoveHeader(ppp);
 				p->RemoveHeader(h);
 				h.SetEcn((Ipv4Header::EcnType)0x03);
+				if (g_cc_trace)
+					fprintf(g_cc_trace, "%lu ECN_MARK sw=%u port=%u pg=%u src=%u dst=%u qlen=%u\n",
+						Simulator::Now().GetTimeStep(), GetId(), ifIndex, qIndex,
+						CcTraceNodeId(h.GetSource().Get()), CcTraceNodeId(h.GetDestination().Get()), m_mmu->egress_bytes[ifIndex][qIndex]);
 				p->AddHeader(h);
 				p->AddHeader(ppp);
 			}

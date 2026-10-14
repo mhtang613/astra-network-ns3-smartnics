@@ -34,6 +34,7 @@
 #include <ns3/rdma.h>
 #include <ns3/sim-setting.h>
 #include <ns3/switch-node.h>
+#include <ns3/cc-trace.h>
 #include <time.h>
 #include <unordered_map>
 
@@ -48,6 +49,7 @@ uint32_t packet_payload_size = 1000, l2_chunk_size = 0, l2_ack_interval = 0;
 double pause_time = 5, simulator_stop_time = 3.01;
 std::string topology_file, flow_file, trace_file, trace_output_file;
 std::string fct_output_file = "fct.txt";
+std::string cc_trace_file = ""; // CC_TRACE_FILE: ECN/CNP/rate event trace, empty = off
 std::string pfc_output_file = "pfc.txt";
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
@@ -87,6 +89,74 @@ string qlen_mon_file;
 
 unordered_map<uint64_t, uint32_t> rate2kmax, rate2kmin;
 unordered_map<uint64_t, double> rate2pmax;
+
+/************************************************
+ * Per-node NIC profiles
+ *
+ * Config syntax:
+ *   RATE_ON_FIRST_CNP 1.0            (global default for the RdmaHw attribute)
+ *   NIC_PROFILE <name> <KEY> <value> [<KEY> <value> ...] END
+ *   NODE_NIC <node_id | a-b> <name>
+ * A profile overrides the listed keys for the hosts assigned to it; keys not
+ * listed fall back to the global value. Hosts without a NODE_NIC line use the
+ * globals ("default"). Only NIC-level keys (the RdmaHw attributes) may appear
+ * in a profile; switch-side settings (ECN thresholds, buffer) stay global.
+ ***********************************************/
+double rate_on_first_cnp = 1.0;
+typedef std::map<std::string, std::string> NicProfile; // config key -> override value
+std::map<std::string, NicProfile> nic_profiles;
+std::map<uint32_t, std::string> node_nic;
+static const char* const nic_profile_keys[] = {
+    "CC_MODE", "CLAMP_TARGET_RATE", "ALPHA_RESUME_INTERVAL", "RP_TIMER",
+    "FAST_RECOVERY_TIMES", "EWMA_GAIN", "RATE_AI", "RATE_HAI",
+    "L2_BACK_TO_ZERO", "L2_CHUNK_SIZE", "L2_ACK_INTERVAL",
+    "RATE_DECREASE_INTERVAL", "MIN_RATE", "MI_THRESH", "VAR_WIN", "FAST_REACT",
+    "MULTI_RATE", "SAMPLE_FEEDBACK", "U_TARGET", "RATE_BOUND", "DCTCP_RATE_AI",
+    "PINT_PROB", "NIC_TOTAL_PAUSE_TIME", "RATE_ON_FIRST_CNP"};
+
+bool nic_profile_key_ok(const std::string& k) {
+  for (const char* const ok : nic_profile_keys)
+    if (k == ok)
+      return true;
+  return false;
+}
+std::string nic_profile_name_for_node(uint32_t id) {
+  auto it = node_nic.find(id);
+  return it == node_nic.end() ? std::string("default") : it->second;
+}
+const NicProfile* nic_profile_for_node(uint32_t id) {
+  auto it = node_nic.find(id);
+  if (it == node_nic.end())
+    return NULL;
+  auto pit = nic_profiles.find(it->second);
+  if (pit == nic_profiles.end()) {
+    std::cerr << "Error: NODE_NIC " << id << " refers to undefined NIC_PROFILE '"
+              << it->second << "'" << std::endl;
+    exit(1);
+  }
+  return &pit->second;
+}
+// Profile override or global fallback, by type.
+std::string nps(const NicProfile* p, const char* k, const std::string& g) {
+  if (!p) return g;
+  auto it = p->find(k);
+  return it == p->end() ? g : it->second;
+}
+double npd(const NicProfile* p, const char* k, double g) {
+  if (!p) return g;
+  auto it = p->find(k);
+  return it == p->end() ? g : std::stod(it->second);
+}
+uint32_t npu(const NicProfile* p, const char* k, uint32_t g) {
+  if (!p) return g;
+  auto it = p->find(k);
+  return it == p->end() ? g : (uint32_t)std::stoul(it->second);
+}
+bool npb(const NicProfile* p, const char* k, bool g) {
+  if (!p) return g;
+  auto it = p->find(k);
+  return it == p->end() ? g : (std::stoul(it->second) != 0);
+}
 
 /************************************************
  * Runtime varibles
@@ -433,6 +503,8 @@ bool ReadConf(string network_configuration) {
       conf >> min_rate;
     } else if (key.compare("FCT_OUTPUT_FILE") == 0) {
       conf >> fct_output_file;
+    } else if (key.compare("CC_TRACE_FILE") == 0) {
+      conf >> cc_trace_file;
     } else if (key.compare("HAS_WIN") == 0) {
       conf >> has_win;
     } else if (key.compare("GLOBAL_T") == 0) {
@@ -514,6 +586,37 @@ bool ReadConf(string network_configuration) {
       conf >> pint_log_base;
     } else if (key.compare("PINT_PROB") == 0) {
       conf >> pint_prob;
+    } else if (key == "RATE_ON_FIRST_CNP") {
+      conf >> rate_on_first_cnp;
+    } else if (key == "NIC_PROFILE") {
+      std::string name;
+      conf >> name;
+      NicProfile prof;
+      std::string k;
+      while (conf >> k && k != "END") {
+        std::string v;
+        conf >> v;
+        if (!nic_profile_key_ok(k)) {
+          std::cerr << "Error: NIC_PROFILE " << name << ": '" << k
+                    << "' is not a per-NIC key" << std::endl;
+          return false;
+        }
+        prof[k] = v;
+      }
+      nic_profiles[name] = prof;
+    } else if (key == "NODE_NIC") {
+      std::string range, name;
+      conf >> range >> name;
+      uint32_t a, b;
+      size_t dash = range.find('-');
+      if (dash == std::string::npos) {
+        a = b = std::stoul(range);
+      } else {
+        a = std::stoul(range.substr(0, dash));
+        b = std::stoul(range.substr(dash + 1));
+      }
+      for (uint32_t id = a; id <= b; id++)
+        node_nic[id] = name;
     } else if (key == "HEADROOM_FACTOR") {
       int v;
       conf >> v;
@@ -747,43 +850,64 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
 
 #if ENABLE_QP
   FILE *fct_output = fopen(fct_output_file.c_str(), "w");
+  if (!cc_trace_file.empty()) {
+    g_cc_trace = fopen(cc_trace_file.c_str(), "w");
+    if (!g_cc_trace)
+      std::cerr << "Warning: cannot open CC_TRACE_FILE " << cc_trace_file << std::endl;
+  }
   std::cout << "QP is enabled " << std::endl;
   //
   // install RDMA driver
   //
+  for (auto& kv : nic_profiles) {
+    std::cout << "NIC_PROFILE " << kv.first << ":";
+    for (auto& ov : kv.second)
+      std::cout << " " << ov.first << "=" << ov.second;
+    std::cout << std::endl;
+  }
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 0) { // is server
+      // Per-node NIC profile: overrides the globals for this host only.
+      const NicProfile* np = nic_profile_for_node(i);
+      std::cout << "node " << i << " NIC profile: " << nic_profile_name_for_node(i)
+                << std::endl;
       // create RdmaHw
       Ptr<RdmaHw> rdmaHw = CreateObject<RdmaHw>();
-      rdmaHw->SetAttribute("ClampTargetRate", BooleanValue(clamp_target_rate));
+      rdmaHw->SetAttribute("ClampTargetRate",
+                           BooleanValue(npb(np, "CLAMP_TARGET_RATE", clamp_target_rate)));
       rdmaHw->SetAttribute("AlphaResumInterval",
-                           DoubleValue(alpha_resume_interval));
-      rdmaHw->SetAttribute("RPTimer", DoubleValue(rp_timer));
+                           DoubleValue(npd(np, "ALPHA_RESUME_INTERVAL", alpha_resume_interval)));
+      rdmaHw->SetAttribute("RPTimer", DoubleValue(npd(np, "RP_TIMER", rp_timer)));
       rdmaHw->SetAttribute("FastRecoveryTimes",
-                           UintegerValue(fast_recovery_times));
-      rdmaHw->SetAttribute("EwmaGain", DoubleValue(ewma_gain));
-      rdmaHw->SetAttribute("RateAI", DataRateValue(DataRate(rate_ai)));
-      rdmaHw->SetAttribute("RateHAI", DataRateValue(DataRate(rate_hai)));
-      rdmaHw->SetAttribute("L2BackToZero", BooleanValue(l2_back_to_zero));
-      rdmaHw->SetAttribute("L2ChunkSize", UintegerValue(l2_chunk_size));
-      rdmaHw->SetAttribute("L2AckInterval", UintegerValue(l2_ack_interval));
-      rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));
+                           UintegerValue(npu(np, "FAST_RECOVERY_TIMES", fast_recovery_times)));
+      rdmaHw->SetAttribute("EwmaGain", DoubleValue(npd(np, "EWMA_GAIN", ewma_gain)));
+      rdmaHw->SetAttribute("RateAI", DataRateValue(DataRate(nps(np, "RATE_AI", rate_ai))));
+      rdmaHw->SetAttribute("RateHAI", DataRateValue(DataRate(nps(np, "RATE_HAI", rate_hai))));
+      rdmaHw->SetAttribute("L2BackToZero",
+                           BooleanValue(npb(np, "L2_BACK_TO_ZERO", l2_back_to_zero)));
+      rdmaHw->SetAttribute("L2ChunkSize", UintegerValue(npu(np, "L2_CHUNK_SIZE", l2_chunk_size)));
+      rdmaHw->SetAttribute("L2AckInterval",
+                           UintegerValue(npu(np, "L2_ACK_INTERVAL", l2_ack_interval)));
+      rdmaHw->SetAttribute("CcMode", UintegerValue(npu(np, "CC_MODE", cc_mode)));
       rdmaHw->SetAttribute("RateDecreaseInterval",
-                           DoubleValue(rate_decrease_interval));
-      rdmaHw->SetAttribute("MinRate", DataRateValue(DataRate(min_rate)));
+                           DoubleValue(npd(np, "RATE_DECREASE_INTERVAL", rate_decrease_interval)));
+      rdmaHw->SetAttribute("MinRate", DataRateValue(DataRate(nps(np, "MIN_RATE", min_rate))));
       rdmaHw->SetAttribute("Mtu", UintegerValue(packet_payload_size));
-      rdmaHw->SetAttribute("MiThresh", UintegerValue(mi_thresh));
-      rdmaHw->SetAttribute("VarWin", BooleanValue(var_win));
-      rdmaHw->SetAttribute("FastReact", BooleanValue(fast_react));
-      rdmaHw->SetAttribute("MultiRate", BooleanValue(multi_rate));
-      rdmaHw->SetAttribute("SampleFeedback", BooleanValue(sample_feedback));
-      rdmaHw->SetAttribute("TargetUtil", DoubleValue(u_target));
-      rdmaHw->SetAttribute("RateBound", BooleanValue(rate_bound));
+      rdmaHw->SetAttribute("MiThresh", UintegerValue(npu(np, "MI_THRESH", mi_thresh)));
+      rdmaHw->SetAttribute("VarWin", BooleanValue(npb(np, "VAR_WIN", var_win)));
+      rdmaHw->SetAttribute("FastReact", BooleanValue(npb(np, "FAST_REACT", fast_react)));
+      rdmaHw->SetAttribute("MultiRate", BooleanValue(npb(np, "MULTI_RATE", multi_rate)));
+      rdmaHw->SetAttribute("SampleFeedback",
+                           BooleanValue(npb(np, "SAMPLE_FEEDBACK", sample_feedback)));
+      rdmaHw->SetAttribute("TargetUtil", DoubleValue(npd(np, "U_TARGET", u_target)));
+      rdmaHw->SetAttribute("RateBound", BooleanValue(npb(np, "RATE_BOUND", rate_bound)));
       rdmaHw->SetAttribute("DctcpRateAI",
-                           DataRateValue(DataRate(dctcp_rate_ai)));
-      rdmaHw->SetPintSmplThresh(pint_prob);
+                           DataRateValue(DataRate(nps(np, "DCTCP_RATE_AI", dctcp_rate_ai))));
+      rdmaHw->SetPintSmplThresh(npd(np, "PINT_PROB", pint_prob));
       rdmaHw->SetAttribute("TotalPauseTimes",
-                           UintegerValue(nic_total_pause_time));
+                           UintegerValue(npu(np, "NIC_TOTAL_PAUSE_TIME", nic_total_pause_time)));
+      rdmaHw->SetAttribute("RateOnFirstCnp",
+                           DoubleValue(npd(np, "RATE_ON_FIRST_CNP", rate_on_first_cnp)));
       // create and install RdmaDriver
       Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
       Ptr<Node> node = n.Get(i);

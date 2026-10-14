@@ -12,8 +12,11 @@
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
+#include "cc-trace.h"
 
 namespace ns3{
+
+FILE* g_cc_trace = NULL;
 
 TypeId RdmaHw::GetTypeId (void)
 {
@@ -368,8 +371,12 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		seqh.SetSport(ch.udp.dport);
 		seqh.SetDport(ch.udp.sport);
 		seqh.SetIntHeader(ch.udp.ih);
-		if (ecnbits)
+		if (ecnbits){
 			seqh.SetCnp();
+			if (g_cc_trace)
+				fprintf(g_cc_trace, "%lu CNP_SENT node=%u src=%u dst=%u sport=%u seq=%u\n",
+					Simulator::Now().GetTimeStep(), m_node->GetId(), CcTraceNodeId(ch.sip), CcTraceNodeId(ch.dip), ch.udp.sport, ch.udp.seq);
+		}
 
 		Ptr<Packet> newp = Create<Packet>(std::max(60-14-20-(int)seqh.GetSerializedSize(), 0));
 		newp->AddHeader(seqh);
@@ -684,6 +691,10 @@ void RdmaHw::ScheduleUpdateAlphaMlx(Ptr<RdmaQueuePair> q){
 }
 
 void RdmaHw::cnp_received_mlx(Ptr<RdmaQueuePair> q){
+	if (g_cc_trace)
+		fprintf(g_cc_trace, "%lu CNP_RCVD node=%u src=%u dst=%u sport=%u rate_gbps=%.3f alpha=%.6f target_gbps=%.3f first=%d\n",
+			Simulator::Now().GetTimeStep(), m_node->GetId(), CcTraceNodeId(q->sip.Get()), CcTraceNodeId(q->dip.Get()), q->sport,
+			q->m_rate.GetBitRate() * 1e-9, q->mlx.m_alpha, q->mlx.m_targetRate.GetBitRate() * 1e-9, q->mlx.m_first_cnp ? 1 : 0);
 	q->mlx.m_alpha_cnp_arrived = true; // set CNP_arrived bit for alpha update
 	q->mlx.m_decrease_cnp_arrived = true; // set CNP_arrived bit for rate decrease
 	if (q->mlx.m_first_cnp){
@@ -713,7 +724,12 @@ void RdmaHw::CheckRateDecreaseMlx(Ptr<RdmaQueuePair> q){
 		}
 		if (clamp)
 			q->mlx.m_targetRate = q->m_rate;
+		DataRate cc_old_rate = q->m_rate;
 		q->m_rate = std::max(m_minRate, q->m_rate * (1 - q->mlx.m_alpha / 2));
+		if (g_cc_trace)
+			fprintf(g_cc_trace, "%lu RATE_DEC node=%u src=%u dst=%u sport=%u old_gbps=%.3f new_gbps=%.3f alpha=%.6f target_gbps=%.3f\n",
+				Simulator::Now().GetTimeStep(), m_node->GetId(), CcTraceNodeId(q->sip.Get()), CcTraceNodeId(q->dip.Get()), q->sport,
+				cc_old_rate.GetBitRate() * 1e-9, q->m_rate.GetBitRate() * 1e-9, q->mlx.m_alpha, q->mlx.m_targetRate.GetBitRate() * 1e-9);
 		// reset rate increase related things
 		q->mlx.m_rpTimeStage = 0;
 		q->mlx.m_decrease_cnp_arrived = false;
@@ -734,14 +750,23 @@ void RdmaHw::RateIncEventTimerMlx(Ptr<RdmaQueuePair> q){
 	q->mlx.m_rpTimeStage++;
 }
 void RdmaHw::RateIncEventMlx(Ptr<RdmaQueuePair> q){
+	DataRate cc_old_rate = q->m_rate;
+	const char* cc_stage;
 	// check which increase phase: fast recovery, active increase, hyper increase
 	if (q->mlx.m_rpTimeStage < m_rpgThreshold){ // fast recovery
 		FastRecoveryMlx(q);
+		cc_stage = "fast_recovery";
 	}else if (q->mlx.m_rpTimeStage == m_rpgThreshold){ // active increase
 		ActiveIncreaseMlx(q);
+		cc_stage = "active";
 	}else { // hyper increase
 		HyperIncreaseMlx(q);
+		cc_stage = "hyper";
 	}
+	if (g_cc_trace)
+		fprintf(g_cc_trace, "%lu RATE_INC node=%u src=%u dst=%u sport=%u stage=%s old_gbps=%.3f new_gbps=%.3f alpha=%.6f target_gbps=%.3f\n",
+			Simulator::Now().GetTimeStep(), m_node->GetId(), CcTraceNodeId(q->sip.Get()), CcTraceNodeId(q->dip.Get()), q->sport,
+			cc_stage, cc_old_rate.GetBitRate() * 1e-9, q->m_rate.GetBitRate() * 1e-9, q->mlx.m_alpha, q->mlx.m_targetRate.GetBitRate() * 1e-9);
 }
 
 void RdmaHw::FastRecoveryMlx(Ptr<RdmaQueuePair> q){
