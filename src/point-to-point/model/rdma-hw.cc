@@ -13,6 +13,8 @@
 #include "qbb-header.h"
 #include "cn-header.h"
 #include "cc-trace.h"
+#include <fstream>
+#include <iostream>
 
 namespace ns3{
 
@@ -269,12 +271,26 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 
 	// Notify Nic
 	m_nic[nic_idx].dev->NewQp(qp);
+
+	if (m_cc_mode == 15)
+		MlccAddQp();
 }
 
 void RdmaHw::DeleteQueuePair(Ptr<RdmaQueuePair> qp){
 	// remove qp from the m_qpMap
 	uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
 	m_qpMap.erase(key);
+	if (m_cc_mode == 15 && m_mlccRunner){
+		if (m_qpMap.empty()){
+			// end of the busy period: stop the timer and drop the runner;
+			// the next flow starts a fresh model window (training windows
+			// begin at flow start)
+			Simulator::Cancel(m_mlccTick);
+			m_mlccRunner.reset();
+		}else{
+			m_mlccRunner->setQps((int)m_qpMap.size());
+		}
+	}
 }
 
 Ptr<RdmaRxQueuePair> RdmaHw::GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint16_t pg, bool create){
@@ -475,6 +491,14 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	if (cnp){
 		if (m_cc_mode == 1){ // mlx version
 			cnp_received_mlx(qp);
+		}else if (m_cc_mode == 15 && m_mlccRunner && !m_mlccTraceActive){
+			// ML model (live CNPs; ignored entirely in trace-replay mode)
+			double t_us = (double)(Simulator::Now() - m_mlccT0).GetNanoSeconds() / 1000.0;
+			m_mlccRunner->addCnp(t_us, 1);
+			if (g_cc_trace)
+				fprintf(g_cc_trace, "%lu CNP_RCVD node=%u src=%u dst=%u sport=%u rate_gbps=%.3f alpha=0.000000 target_gbps=0.000 first=0\n",
+					Simulator::Now().GetTimeStep(), m_node->GetId(), CcTraceNodeId(qp->sip.Get()), CcTraceNodeId(qp->dip.Get()), qp->sport,
+					qp->m_rate.GetBitRate() * 1e-9);
 		}
 	}
 
@@ -665,6 +689,130 @@ void RdmaHw::ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate){
 
 	// change to new rate
 	qp->m_rate = new_rate;
+}
+
+/******************************
+ * ML congestion control (CC_MODE 15)
+ * A learned NIC model (mlcc.h, exported from the measured-data models)
+ * drives the host's AGGREGATE send rate: CNP-flagged ACKs feed a streaming
+ * feature pipeline; every 100 us the model emits the node rate, split
+ * evenly across the active QPs. The model predicts the node aggregate
+ * (trained that way), so there is ONE runner per host, not per QP.
+ *****************************/
+static std::map<std::string, mlcc::Model> g_mlcc_models; // path -> model
+
+void RdmaHw::SetMlccModel(const std::string& path){
+	m_mlccModelPath = path;
+}
+void RdmaHw::SetMlccReg(const std::string& name, double value){
+	m_mlccRegs[name] = value;
+}
+void RdmaHw::SetMlccApply(bool apply){
+	m_mlccApply = apply;
+}
+void RdmaHw::SetMlccCap(double cap_gbps){
+	m_mlccCap = cap_gbps;
+}
+void RdmaHw::SetMlccTrace(const std::string& path){
+	m_mlccTracePath = path;
+}
+
+// Trace-replay delivery of one recorded CNP arrival (scheduled by
+// MlccAddQp). t_us is the RECORDED 1 us bin, passed through unchanged so
+// the model sees exactly the recorded stream.
+void RdmaHw::MlccTraceCnp(double t_us, int count){
+	if (!m_mlccRunner)
+		return;
+	m_mlccRunner->addCnp(t_us + 0.5, count);
+	if (g_cc_trace && !m_qpMap.empty()){
+		Ptr<RdmaQueuePair> q0 = m_qpMap.begin()->second;
+		fprintf(g_cc_trace, "%lu CNP_RCVD node=%u src=%u dst=%u sport=%u rate_gbps=%.3f alpha=0.000000 target_gbps=0.000 first=0\n",
+			Simulator::Now().GetTimeStep(), m_node->GetId(), CcTraceNodeId(q0->sip.Get()), CcTraceNodeId(q0->dip.Get()), q0->sport,
+			q0->m_rate.GetBitRate() * 1e-9);
+	}
+}
+
+void RdmaHw::MlccAddQp(){
+	if (m_mlccRunner){
+		m_mlccRunner->setQps((int)m_qpMap.size());
+		return;
+	}
+	if (m_mlccModelPath.empty()){
+		std::cerr << "Error: CC_MODE 15 on node " << m_node->GetId()
+		          << " needs MODEL_FILE in its NIC_PROFILE" << std::endl;
+		exit(1);
+	}
+	auto it = g_mlcc_models.find(m_mlccModelPath);
+	if (it == g_mlcc_models.end())
+		it = g_mlcc_models.emplace(m_mlccModelPath,
+		                           mlcc::Model::load(m_mlccModelPath)).first;
+	const mlcc::Model& model = it->second;
+	uint32_t nic_idx = GetNicIdxOfQp(m_qpMap.begin()->second);
+	double link_gbps = m_nic[nic_idx].dev->GetDataRate().GetBitRate() * 1e-9;
+	double cap = m_mlccCap > 0.0 ? m_mlccCap
+	                             : std::min(link_gbps, model.clip_max);
+	m_mlccRunner.reset(new mlcc::Runner(model, m_mlccRegs,
+	                                    (int)m_qpMap.size(), cap));
+	m_mlccT0 = Simulator::Now();
+	m_mlccTick = Simulator::Schedule(MicroSeconds(model.step_us),
+	                                 &RdmaHw::MlccTick, this);
+	printf("node %u mlcc: model=%s vendor=%s type=%s qps=%u cap=%gG%s\n",
+	       m_node->GetId(), m_mlccModelPath.c_str(), model.vendor.c_str(),
+	       model.type.c_str(), (uint32_t)m_qpMap.size(), cap,
+	       m_mlccTracePath.empty() ? "" : " trace-replay");
+	if (!m_mlccTracePath.empty()){
+		// CNP trace replay: schedule every recorded arrival relative to
+		// THIS runner's t0. Real CNP-flagged ACKs are ignored while
+		// active (ReceiveAck). NOTE: meant for single-busy-period runs; a
+		// second busy period would re-schedule the whole trace again.
+		std::ifstream tf(m_mlccTracePath);
+		if (!tf){
+			std::cerr << "Error: cannot open CNP_TRACE_FILE "
+			          << m_mlccTracePath << std::endl;
+			exit(1);
+		}
+		m_mlccTraceActive = true;
+		std::string line;
+		uint32_t n = 0;
+		while (std::getline(tf, line)){
+			long t; int c;
+			if (sscanf(line.c_str(), "%ld,%d", &t, &c) == 2){
+				Simulator::Schedule(NanoSeconds(t * 1000 + 500),
+				                    &RdmaHw::MlccTraceCnp, this,
+				                    (double)t, c);
+				n++;
+			}
+		}
+		printf("node %u mlcc: replaying %u CNP rows from %s\n",
+		       m_node->GetId(), n, m_mlccTracePath.c_str());
+	}
+}
+
+void RdmaHw::MlccTick(){
+	if (!m_mlccRunner)
+		return;
+	double node_gbps = m_mlccRunner->step();
+	if (!m_qpMap.empty()){
+		double per_qp = node_gbps / (double)m_qpMap.size();
+		uint64_t bps = (uint64_t)(per_qp * 1e9);
+		if (bps < m_minRate.GetBitRate())
+			bps = m_minRate.GetBitRate();
+		if (m_mlccApply){
+			DataRate nr(bps);
+			for (auto& it : m_qpMap)
+				if (it.second->m_rate.GetBitRate() != bps)
+					ChangeRate(it.second, nr);
+		}
+		if (g_cc_trace){
+			Ptr<RdmaQueuePair> q0 = m_qpMap.begin()->second;
+			fprintf(g_cc_trace, "%lu ML_RATE node=%u src=%u sport=0 qps=%u node_gbps=%.4f per_qp_gbps=%.4f\n",
+				Simulator::Now().GetTimeStep(), m_node->GetId(),
+				CcTraceNodeId(q0->sip.Get()), (uint32_t)m_qpMap.size(),
+				node_gbps, bps * 1e-9);
+		}
+	}
+	m_mlccTick = Simulator::Schedule(
+		MicroSeconds(m_mlccRunner->model().step_us), &RdmaHw::MlccTick, this);
 }
 
 #define PRINT_LOG 0

@@ -7,7 +7,11 @@
 #include <ns3/custom-header.h>
 #include "qbb-net-device.h"
 #include <unordered_map>
+#include <map>
+#include <memory>
+#include <string>
 #include "pint.h"
+#include "mlcc.h"
 
 namespace ns3 {
 
@@ -47,6 +51,33 @@ public:
 	// qp complete callback
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpCompleteCallback;
 	QpCompleteCallback m_qpCompleteCallback;
+
+	// ML congestion control (CC_MODE 15): a learned per-vendor NIC model
+	// (see mlcc.h) drives this host's AGGREGATE send rate on a 100 us
+	// timer; CNP-flagged ACKs feed its feature stream. Configured per node
+	// via NIC_PROFILE keys MODEL_FILE / REG (scratch/common.h).
+	std::string m_mlccModelPath;
+	std::map<std::string, double> m_mlccRegs; // register overrides
+	bool m_mlccApply = true; // false = observe-only: the model sees the
+	                         // CNPs and logs ML_RATE, but never throttles
+	                         // (senders stay at line rate)
+	double m_mlccCap = 0.0;  // >0 = override of the cap feature (Gb/s);
+	                         // 0 = min(link rate, model clip) as usual
+	std::string m_mlccTracePath; // non-empty = CNP TRACE REPLAY mode: the
+	                         // model is fed the recorded stream (t_us,count
+	                         // rows) and real CNP-flagged ACKs are IGNORED
+	bool m_mlccTraceActive = false;
+	std::unique_ptr<mlcc::Runner> m_mlccRunner;
+	Time m_mlccT0;       // feature-time origin (first QP of the busy period)
+	EventId m_mlccTick;
+	void SetMlccModel(const std::string& path);
+	void SetMlccReg(const std::string& name, double value);
+	void SetMlccApply(bool apply);
+	void SetMlccCap(double cap_gbps);
+	void SetMlccTrace(const std::string& path);
+	void MlccTraceCnp(double t_us, int count);
+	void MlccAddQp();    // start the runner / update its QP count
+	void MlccTick();     // close a 100 us step, apply the model rate
 
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb); // setup shared data and callbacks with the QbbNetDevice

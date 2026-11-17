@@ -43,6 +43,7 @@ build_lib(
     helper/qbb-helper.h
     helper/sim-setting.h
     model/cc-trace.h
+    model/mlcc.h
     model/cn-header.h
     model/pause-header.h
     model/pint.h

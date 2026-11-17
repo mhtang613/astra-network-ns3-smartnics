@@ -112,7 +112,16 @@ static const char* const nic_profile_keys[] = {
     "L2_BACK_TO_ZERO", "L2_CHUNK_SIZE", "L2_ACK_INTERVAL",
     "RATE_DECREASE_INTERVAL", "MIN_RATE", "MI_THRESH", "VAR_WIN", "FAST_REACT",
     "MULTI_RATE", "SAMPLE_FEEDBACK", "U_TARGET", "RATE_BOUND", "DCTCP_RATE_AI",
-    "PINT_PROB", "NIC_TOTAL_PAUSE_TIME", "RATE_ON_FIRST_CNP"};
+    "PINT_PROB", "NIC_TOTAL_PAUSE_TIME", "RATE_ON_FIRST_CNP",
+    // ML congestion control (CC_MODE 15): path to a .mlcc model file.
+    // Register overrides use the separate "REG <name> <value>" profile
+    // entry (stored as "REG:<name>"), validated against the model's own
+    // register list when the model is loaded. ML_APPLY 0 = observe-only:
+    // the model sees the CNPs and logs ML_RATE but never throttles.
+    // MODEL_CAP <gbps> overrides the cap feature (default min(link, 200));
+    // CNP_TRACE_FILE <path> = trace-replay mode: the model is fed the
+    // recorded stream and live CNP-flagged ACKs are ignored.
+    "MODEL_FILE", "ML_APPLY", "MODEL_CAP", "CNP_TRACE_FILE"};
 
 bool nic_profile_key_ok(const std::string& k) {
   for (const char* const ok : nic_profile_keys)
@@ -594,6 +603,12 @@ bool ReadConf(string network_configuration) {
       NicProfile prof;
       std::string k;
       while (conf >> k && k != "END") {
+        if (k == "REG") { // ML-model register override: REG <name> <value>
+          std::string rname, rv;
+          conf >> rname >> rv;
+          prof["REG:" + rname] = rv;
+          continue;
+        }
         std::string v;
         conf >> v;
         if (!nic_profile_key_ok(k)) {
@@ -908,6 +923,17 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
                            UintegerValue(npu(np, "NIC_TOTAL_PAUSE_TIME", nic_total_pause_time)));
       rdmaHw->SetAttribute("RateOnFirstCnp",
                            DoubleValue(npd(np, "RATE_ON_FIRST_CNP", rate_on_first_cnp)));
+      // ML congestion control (CC_MODE 15): model file + register overrides
+      std::string mlcc_model = nps(np, "MODEL_FILE", "");
+      if (!mlcc_model.empty()) {
+        rdmaHw->SetMlccModel(mlcc_model);
+        rdmaHw->SetMlccApply(npu(np, "ML_APPLY", 1) != 0);
+        rdmaHw->SetMlccCap(npd(np, "MODEL_CAP", 0.0));
+        rdmaHw->SetMlccTrace(nps(np, "CNP_TRACE_FILE", ""));
+        for (auto& ov : *np)
+          if (ov.first.rfind("REG:", 0) == 0)
+            rdmaHw->SetMlccReg(ov.first.substr(4), std::stod(ov.second));
+      }
       // create and install RdmaDriver
       Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
       Ptr<Node> node = n.Get(i);
